@@ -1,0 +1,6 @@
+dateset/*
+*.index
+*.meta
+*.jpg
+checkpoint
+*00001
