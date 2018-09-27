@@ -1,6 +1,4 @@
-import importlib
 import math
-import os
 import time
 
 import cv2
@@ -8,148 +6,83 @@ import numpy as np
 import tensorflow as tf
 from pynput.keyboard import Key, Controller
 
-from classify_inference import Inference
+from classify_inference import ClassifyInference
 from config import FLAGS
-from utils import cpm_utils, tracking_module, utils
-
-cpm_model = importlib.import_module('models.nets.' + FLAGS.network_def)
+from cpm_inference import CPMInference
+from utils import tracking_module, utils
 
 joint_detections = np.zeros(shape=(21, 2))
 
 
 def main(argv):
     global joint_detections
-    os.environ['CUDA_VISIBLE_DEVICES'] = str(FLAGS.gpu_id)
 
-    """ Initial tracker
-    """
+    # Create webcam instance
+    cam = cv2.VideoCapture(FLAGS.cam_id)
+
+    # Create kalman filters
+    kalman_filter_array = [cv2.KalmanFilter(4, 2) for _ in range(FLAGS.num_of_joints)]
+    for _, joint_kalman_filter in enumerate(kalman_filter_array):
+        joint_kalman_filter.transitionMatrix = np.array(
+            [[1, 0, 1, 0], [0, 1, 0, 1], [0, 0, 1, 0], [0, 0, 0, 1]],
+            np.float32)
+        joint_kalman_filter.measurementMatrix = np.array([[1, 0, 0, 0], [0, 1, 0, 0]], np.float32)
+        joint_kalman_filter.processNoiseCov = np.array([[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]],
+                                                       np.float32) * FLAGS.kalman_noise
+
+    cpm_inference = CPMInference()
+    classify_inference = ClassifyInference()
+    keyboard = Controller()
     tracker = tracking_module.SelfTracker([FLAGS.webcam_height, FLAGS.webcam_width], FLAGS.input_size)
 
-    """ Build network graph
-    """
-    model = cpm_model.CPM_Model(input_size=FLAGS.input_size,
-                                heatmap_size=FLAGS.heatmap_size,
-                                stages=FLAGS.cpm_stages,
-                                joints=FLAGS.num_of_joints,
-                                img_type=FLAGS.color_channel,
-                                is_training=False)
-    saver = tf.train.Saver()
+    count = 0
+    action_count = [5, 10, 20, 40]
+    last_gesture = -1
+    action = ['up', 'down', 'left', 'right', 'larger', 'smaller']
+    labels2key = {0: Key.down, 1: Key.up, 2: Key.right, 3: Key.left, 4: '+', 5: '-'}
 
-    """ Get output node
-    """
-    output_node = tf.get_default_graph().get_tensor_by_name(name=FLAGS.output_node_names)
+    while True:
+        # Prepare input image
+        _, full_img = cam.read()
 
-    device_count = {'GPU': 1} if FLAGS.use_gpu else {'GPU': 0}
-    sess_config = tf.ConfigProto(device_count=device_count)
-    sess_config.gpu_options.per_process_gpu_memory_fraction = 0.2
-    sess_config.gpu_options.allow_growth = True
-    sess_config.allow_soft_placement = True
-    with tf.Session(config=sess_config) as sess:
+        test_img = tracker.tracking_by_joints(full_img, joint_detections=joint_detections)
+        crop_full_scale = tracker.input_crop_ratio
+        test_img_copy = test_img.copy()
 
-        model_path_suffix = os.path.join(FLAGS.network_def,
-                                         'input_{}_output_{}'.format(FLAGS.input_size, FLAGS.heatmap_size),
-                                         'joints_{}'.format(FLAGS.num_of_joints),
-                                         'stages_{}'.format(FLAGS.cpm_stages),
-                                         'init_{}_rate_{}_step_{}'.format(FLAGS.init_lr, FLAGS.lr_decay_rate,
-                                                                          FLAGS.lr_decay_step)
-                                         )
-        model_save_dir = os.path.join('models',
-                                      'weights',
-                                      model_path_suffix)
-        print('Load model from [{}]'.format(os.path.join(model_save_dir, FLAGS.model_path)))
-        if FLAGS.model_path.endswith('pkl'):
-            model.load_weights_from_file(FLAGS.model_path, sess, False)
-        else:
-            saver.restore(sess, 'models/weights/cpm_hand')
+        # White balance
+        test_img_wb = utils.img_white_balance(test_img, 5)
+        test_img_input = normalize_and_centralize_img(test_img_wb)
 
-        # Check weights
-        for variable in tf.global_variables():
-            with tf.variable_scope('', reuse=True):
-                var = tf.get_variable(variable.name.split(':0')[0])
-                print(variable.name, np.mean(sess.run(var)))
+        # Inference
+        t1 = time.time()
+        stage_heatmap_np = cpm_inference.predict(test_img_input)
+        # print('FPS: %.2f' % (1 / (time.time() - t1)))
 
-        # Create webcam instance
-        cam = cv2.VideoCapture(FLAGS.cam_id)
+        local_img, response = visualize_result(full_img, stage_heatmap_np, kalman_filter_array, tracker,
+                                               crop_full_scale, test_img_copy)
 
-        # Create kalman filters
-        kalman_filter_array = [cv2.KalmanFilter(4, 2) for _ in range(FLAGS.num_of_joints)]
-        for _, joint_kalman_filter in enumerate(kalman_filter_array):
-            joint_kalman_filter.transitionMatrix = np.array(
-                [[1, 0, 1, 0], [0, 1, 0, 1], [0, 0, 1, 0], [0, 0, 0, 1]],
-                np.float32)
-            joint_kalman_filter.measurementMatrix = np.array([[1, 0, 0, 0], [0, 1, 0, 0]], np.float32)
-            joint_kalman_filter.processNoiseCov = np.array([[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]],
-                                                           np.float32) * FLAGS.kalman_noise
+        cv2.imshow('local_img', local_img.astype(np.uint8))  # 训练用图
+        cv2.imshow('globalq_img', full_img.astype(np.uint8))  # 单人大框
 
-        infer = Inference()
-        count = 0
-        last_gesture = -1
-        gesture2label = ['up', 'down', 'left', 'right', 'larger', 'smaller']
-        keyboard = Controller()
-        while True:
-            # Prepare input image
-            _, full_img = cam.read()
-
-            test_img = tracker.tracking_by_joints(full_img, joint_detections=joint_detections)
-            crop_full_scale = tracker.input_crop_ratio
-            test_img_copy = test_img.copy()
-
-            # White balance
-            test_img_wb = utils.img_white_balance(test_img, 5)
-            test_img_input = normalize_and_centralize_img(test_img_wb)
-
-            # Inference
-            t1 = time.time()
-            stage_heatmap_np = sess.run([output_node],
-                                        feed_dict={model.input_images: test_img_input})
-            # print('FPS: %.2f' % (1 / (time.time() - t1)))
-
-            local_img, response = visualize_result(full_img, stage_heatmap_np, kalman_filter_array, tracker,
-                                                   crop_full_scale, test_img_copy)
-
-            cv2.imshow('local_img', local_img.astype(np.uint8))  # 训练用图
-            cv2.imshow('globalq_img', full_img.astype(np.uint8))  # 单人大框
-
-            if response > 5.0:
-                rst = infer.predict([cv2.resize(local_img, (100, 100))])
-                print(gesture2label[rst])
-                if rst == last_gesture:
-                    count += 1
-                else:
-                    count = 1
-                    last_gesture = rst
-
-                # gesture2label = ['up', 'down', 'left', 'right', 'larger', 'smaller']
-                if count == 5 or count == 10 or count == 20 or count == 40:
-                    if last_gesture == 0:
-                        keyboard.press(Key.down)
-                        keyboard.release(Key.down)
-                        print('up')
-                    elif last_gesture == 1:
-                        keyboard.press(Key.up)
-                        keyboard.release(Key.up)
-                        print('down')
-                    elif last_gesture == 2:
-                        keyboard.press(Key.right)
-                        keyboard.release(Key.right)
-                        print('left')
-                    elif last_gesture == 3:
-                        keyboard.press(Key.left)
-                        keyboard.release(Key.left)
-                        print('right')
-                    elif last_gesture == 4:
-                        keyboard.press('+')
-                        keyboard.release('+')
-                        print('larger')
-                    else:
-                        keyboard.press('-')
-                        keyboard.release('-')
-                        print('smaller')
+        if response > 5.0:
+            rst = classify_inference.predict([cv2.resize(local_img, (100, 100))])
+            if rst == last_gesture:
+                count += 1
             else:
-                print(response)
+                count = 1
+                last_gesture = rst
 
-            if cv2.waitKey(1) == ord('q'):
-                break
+            if count in action_count:
+                keyboard.press(labels2key[last_gesture])
+                keyboard.release(labels2key[last_gesture])
+                print(action[last_gesture])
+        else:
+            last_gesture = -1
+
+        if cv2.waitKey(1) == ord('q'):
+            cpm_inference.shutdown()
+            classify_inference.shutdown()
+            break
 
 
 def normalize_and_centralize_img(img):
@@ -295,7 +228,7 @@ def draw_hand(full_img, joint_coords, is_loss_track):
         x2 = int(joint_coords[int(FLAGS.limbs[limb_num][1])][0])
         y2 = int(joint_coords[int(FLAGS.limbs[limb_num][1])][1])
         length = ((x1 - x2) ** 2 + (y1 - y2) ** 2) ** 0.5
-        if length < 150 and length > 5:
+        if 150 > length > 5:
             deg = math.degrees(math.atan2(x1 - x2, y1 - y2))
             polygon = cv2.ellipse2Poly((int((y1 + y2) / 2), int((x1 + x2) / 2)),
                                        (int(length / 2), 3),

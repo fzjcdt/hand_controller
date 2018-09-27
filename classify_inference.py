@@ -1,7 +1,7 @@
 import tensorflow as tf
 
 
-class Inference(object):
+class ClassifyInference(object):
 
     def __init__(self):
 
@@ -21,3 +21,6 @@ class Inference(object):
         with self.sess.as_default():
             with self.graph.as_default():
                 return tf.argmax(classification_result, 1).eval(session=self.sess)[0]
+
+    def shutdown(self):
+        self.sess.close()

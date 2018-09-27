@@ -8,7 +8,7 @@
  - [x] Build an environment of tensorflow-gpu, opencv, etc.
  - [x] Build a data set and train a model.
  - [x] Load cpm and classification models to detect gestures and react accordingly.
- - [ ] Optimize multiple model loading.
+ - [x] Optimize multiple model loading.
  - [ ] The heat map is a grayscale map that does not require 3 channels, and using one channel to reduce the amount of calculation.
  - [ ] Add a layer of convolution and pooling layer to become AlexNet, the input size does not need to be compressed to 100*100.
  - [ ] Increase data sets and add other categories to improve generalization.
